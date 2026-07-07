@@ -1,44 +1,3 @@
-# from django.shortcuts import render
-
-# from rest_framework.decorators import api_view
-# from rest_framework.response import Response
-# from rest_framework import status
-# from core.settings import db
-# from utils.otp import generate_dummy_otp, send_sms_dummy
-# from datetime import datetime, timezone
-
-# # MongoDB collection reference
-# users_collection = db['users']
-
-# @api_view(['POST'])
-# def send_otp(request):
-#     phone = request.data.get('phone')
-    
-#     if not phone:
-#         return Response({"error": "Phone number is required"}, status=status.HTTP_400_BAD_REQUEST)
-    
-#     # 1. Generate OTP
-#     otp = generate_dummy_otp(phone)
-    
-#     # 2. Database me save ya update karein (Upsert logic)
-#     users_collection.update_one(
-#         {"phone": phone},
-#         {"$set": {
-#             "phone": phone,
-#             "last_otp": otp,
-#             "otp_created_at": datetime.now(timezone.utc),
-#             "role": "user" # Default role
-#         }},
-#         upsert=True
-#     )
-    
-#     # 3. Dummy SMS bhejein
-#     send_sms_dummy(phone, otp)
-    
-#     return Response({
-#         "message": "OTP sent successfully",
-#         "phone": phone
-#     }, status=status.HTTP_200_OK)
 
 import os
 import jwt
@@ -50,10 +9,14 @@ from .serializers import*
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .serializers import PlaceOrderSerializer # Serializer import kiya
+from .serializers import PlaceOrderSerializer 
 from core.settings import db
 from bson import ObjectId
 from datetime import datetime, timezone
+from rest_framework.response import Response
+from pymongo import ASCENDING
+from datetime import datetime, timezone
+
 
 users_collection = db['users']
 
@@ -235,3 +198,419 @@ class PlaceOrderAPIView(APIView):
             "message": "Order placed successfully!", 
             "order_id": str(order_result.inserted_id)
         }, status=status.HTTP_201_CREATED)
+
+
+
+animals_collection = db['animals']
+vendors_collection = db['vendors']
+        # ── Token helper — tumhare existing pattern se same ──
+def get_token_data(request):
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None, None
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(
+            token,
+            os.getenv('SECRET_KEY', 'django-insecure-fallback-key'),
+            algorithms=['HS256']
+        )
+        return payload.get('user_id'), payload.get('role')
+    except Exception:
+        return None, None
+
+
+# ══════════════════════════════════════════
+# 1. ANIMAL LIST — Saare available animals
+#    GET /api/animals/list/
+#    Query params: ?category=Goat&city=Makkah&page=1
+# ══════════════════════════════════════════
+class AnimalListView(APIView):
+
+    def get(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # ── Optional filters query params se ──
+        category  = request.query_params.get('category')   # Goat, Sheep, Cow, Camel
+        city      = request.query_params.get('city')
+        page      = int(request.query_params.get('page', 1))
+        page_size = int(request.query_params.get('page_size', 10))
+        skip      = (page - 1) * page_size
+
+        # ── Match query banao ──
+        match_query = {'status': 'Available'}
+        if category:
+            match_query['animal_category'] = category
+        if city:
+            match_query['city'] = city
+
+        # ── Aggregation Pipeline ──
+        # Ek hi query mein:
+        # 1. Filter karo
+        # 2. Vendor rating bhi lao
+        # 3. Total count bhi
+        # 4. Pagination bhi
+        pipeline = [
+            {'$match': match_query},
+            {'$sort':  {'created_at': -1}},
+
+            # Vendor collection se rating lao
+            {'$lookup': {
+                'from':         'vendors',
+                'localField':   'vendor_user_id',
+                'foreignField': 'user_id',
+                'as':           'vendor_info'
+            }},
+            {'$unwind': {
+                'path': '$vendor_info',
+                'preserveNullAndEmptyArrays': True
+            }},
+
+            # Ek pipeline mein data + total count dono
+            {'$facet': {
+                'animals': [
+                    {'$skip':  skip},
+                    {'$limit': page_size},
+                    {'$project': {
+                        '_id':              {'$toString': '$_id'},
+                        'animal_category':  1,
+                        'breed':            1,
+                        'weight':           1,
+                        'price':            1,
+                        'images':           1,
+                        'status':           1,
+                        'slaughterhouse_name': 1,
+                        'city':             1,
+                        'vendor_rating':    '$vendor_info.rating',
+                    }}
+                ],
+                'total_count': [
+                    {'$count': 'count'}
+                ],
+                # Category wise count — filter chips ke liye
+                'category_summary': [
+                    {'$group': {
+                        '_id':   '$animal_category',
+                        'count': {'$sum': 1}
+                    }}
+                ]
+            }}
+        ]
+
+        result   = list(animals_collection.aggregate(pipeline))
+        data     = result[0]
+
+        animals  = data.get('animals', [])
+        total    = data['total_count'][0]['count'] \
+                   if data.get('total_count') else 0
+        summary  = data.get('category_summary', [])
+
+        # datetime clean karo
+        for animal in animals:
+            if isinstance(animal.get('created_at'), datetime):
+                animal['created_at'] = animal['created_at'].isoformat()
+
+        serializer = AnimalListSerializer(animals, many=True)
+
+        return Response({
+            'status':  1,
+            'message': 'Animals fetched successfully.',
+            'total':   total,
+            'page':    page,
+            'pages':   (total + page_size - 1) // page_size,
+            'filters': {
+                'category': category,
+                'city':     city,
+            },
+            'category_summary': summary,  # frontend filter chips ke liye
+            'data':    serializer.data
+        }, status=status.HTTP_200_OK)
+
+
+class AnimalDetailView(APIView):
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # ── Body se animal_id lo ──
+        animal_id = request.data.get('animal_id')
+        if not animal_id:
+            return Response({
+                'status':  0,
+                'message': 'animal_id is required.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Animal ID validate karo ──
+        try:
+            obj_id = ObjectId(animal_id)
+        except Exception:
+            return Response({
+                'status':  0,
+                'message': 'Invalid animal ID.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # ── Aggregation Pipeline ──
+        pipeline = [
+            {'$match': {'_id': obj_id}},
+            {'$lookup': {
+                'from':         'vendors',
+                'localField':   'vendor_user_id',
+                'foreignField': 'user_id',
+                'as':           'vendor_info'
+            }},
+            {'$unwind': {
+                'path': '$vendor_info',
+                'preserveNullAndEmptyArrays': True
+            }},
+            {'$lookup': {
+                'from':         'slots',
+                'localField':   'vendor_user_id',
+                'foreignField': 'vendor_user_id',
+                'as':           'available_slots'
+            }},
+            {'$project': {
+                '_id':               {'$toString': '$_id'},
+                'animal_category':   1,
+                'breed':             1,
+                'age':               1,
+                'weight':            1,
+                'price':             1,
+                'description':       1,
+                'images':            1,
+                'status':            1,
+                'vendor_user_id':    1,
+                'slaughterhouse_name': 1,
+                'city':              1,
+                'created_at':        1,
+                'vendor_rating':     '$vendor_info.rating',
+                'vendor_capacity':   '$vendor_info.capacity',
+                'available_slots': {
+                    '$filter': {
+                        'input': '$available_slots',
+                        'as':    'slot',
+                        'cond':  {'$lt': ['$$slot.booked', '$$slot.capacity']}
+                    }
+                }
+            }}
+        ]
+
+        result = list(animals_collection.aggregate(pipeline))
+
+        if not result:
+            return Response({
+                'status':  0,
+                'message': 'Animal not found.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        animal = result[0]
+
+        # ── datetime clean ──
+        if isinstance(animal.get('created_at'), datetime):
+            animal['created_at'] = animal['created_at'].isoformat()
+
+        # ── Slots clean ──
+        clean_slots = []
+        for slot in animal.get('available_slots', []):
+            clean_slots.append({
+                'slot_id':   str(slot.get('_id', '')),
+                'date':      slot.get('date'),
+                'time_from': slot.get('time_from'),
+                'time_to':   slot.get('time_to'),
+                'capacity':  slot.get('capacity'),
+                'booked':    slot.get('booked', 0),
+                'remaining': slot.get('capacity', 0) - slot.get('booked', 0)
+            })
+        animal['available_slots'] = clean_slots
+
+        serializer = AnimalDetailSerializer(animal)
+
+        return Response({
+
+            'status':          1,
+            'message':         'Animal detail fetched.',
+            'data':            animal,
+            'available_slots': clean_slots
+            }, status=status.HTTP_200_OK)
+
+
+users_collection  = db['users']
+slots_collection  = db['slots'] 
+
+
+
+# ══════════════════════════════════════════
+# 4. AVAILABLE DATES — Calendar ke liye
+#    POST /api/vendor/slots/available-dates/
+# ══════════════════════════════════════════
+class AvailableDatesAPIView(APIView):
+
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # ── Serializer validation ──
+        serializer = AvailableDatesSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({
+                'status':  0,
+                'message': 'Validation error',
+                'errors':  serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        vendor_user_id = serializer.validated_data['vendor_user_id']
+
+        # ── Aaj ki date ──
+        today = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+        # ── Aggregation Pipeline ──
+        pipeline = [
+            {
+                '$match': {
+                    'vendor_user_id': vendor_user_id,
+                    'date':           {'$gte': today},
+                    '$expr':          {'$lt': ['$booked', '$capacity']}
+                }
+            },
+            {
+                '$group': {
+                    '_id':            '$date',
+                    'total_slots':    {'$sum': 1},
+                    'total_capacity': {'$sum': '$capacity'},
+                    'total_booked':   {'$sum': '$booked'},
+                }
+            },
+            {
+                '$project': {
+                    '_id':             0,
+                    'date':            '$_id',
+                    'total_slots':     1,
+                    'total_remaining': {
+                        '$subtract': ['$total_capacity', '$total_booked']
+                    },
+                }
+            },
+            {'$sort': {'date': ASCENDING}}
+        ]
+
+        dates = list(slots_collection.aggregate(pipeline))
+
+        return Response({
+            'status':  1,
+            'message': 'Available dates fetched.',
+            'count':   len(dates),
+            'data':    dates
+        }, status=status.HTTP_200_OK)
+
+
+# ══════════════════════════════════════════
+# 5. SLOTS BY DATE — Time slots
+#    POST /api/vendor/slots/by-date/
+# ══════════════════════════════════════════
+class SlotsByDateAPIView(APIView):
+
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        # ── Serializer validation ──
+        serializer = SlotsByDateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({
+                'status':  0,
+                'message': 'Validation error',
+                'errors':  serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        vendor_user_id = serializer.validated_data['vendor_user_id']
+        date           = str(serializer.validated_data['date'])
+
+        # ── Aggregation Pipeline ──
+        pipeline = [
+            {
+                '$match': {
+                    'vendor_user_id': vendor_user_id,
+                    'date':           date
+                }
+            },
+            {'$sort': {'time_from': ASCENDING}},
+            {
+                '$project': {
+                    '_id':       {'$toString': '$_id'},
+                    'date':      1,
+                    'time_from': 1,
+                    'time_to':   1,
+                    'capacity':  1,
+                    'booked':    1,
+                    'remaining': {
+                        '$subtract': ['$capacity', '$booked']
+                    },
+                    'label': {
+                        '$switch': {
+                            'branches': [
+                                {
+                                    'case': {
+                                        '$gte': ['$booked', '$capacity']
+                                    },
+                                    'then': 'Full'
+                                },
+                                {
+                                    'case': {
+                                        '$lte': [
+                                            {
+                                                '$subtract': [
+                                                    '$capacity',
+                                                    '$booked'
+                                                ]
+                                            },
+                                            {
+                                                '$multiply': [
+                                                    '$capacity',
+                                                    0.2
+                                                ]
+                                            }
+                                        ]
+                                    },
+                                    'then': 'Limited'
+                                },
+                            ],
+                            'default': 'Good Time'
+                        }
+                    },
+                    'is_available': {
+                        '$lt': ['$booked', '$capacity']
+                    }
+                }
+            }
+        ]
+
+        slots = list(slots_collection.aggregate(pipeline))
+
+        return Response({
+            'status':  1,
+            'message': 'Slots fetched successfully.',
+            'date':    date,
+            'count':   len(slots),
+            'data':    slots
+        }, status=status.HTTP_200_OK)
+

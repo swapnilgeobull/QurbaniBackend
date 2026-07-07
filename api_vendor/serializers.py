@@ -59,3 +59,22 @@ class InventoryListSerializer(serializers.Serializer):
     images = serializers.ListField(child=serializers.CharField())
     status = serializers.CharField()
     created_at = serializers.DateTimeField()
+
+
+
+class SlotCreateSerializer(serializers.Serializer):
+    date      = serializers.DateField(required=True)
+    time_from = serializers.CharField(max_length=20, required=True)  # "08:00 AM"
+    time_to   = serializers.CharField(max_length=20, required=True)  # "09:00 AM"
+    capacity  = serializers.IntegerField(required=True, min_value=1)
+
+    def validate(self, data):
+        if data['time_from'] == data['time_to']:
+            raise serializers.ValidationError(
+                "time_from and time_to are same."
+            )
+        return data
+
+
+class SlotDeleteSerializer(serializers.Serializer):
+    slot_id = serializers.CharField(required=True)

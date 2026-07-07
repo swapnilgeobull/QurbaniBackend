@@ -8,6 +8,7 @@ from django.core.files.storage import FileSystemStorage
 from pymongo import ReturnDocument
 from core.settings import db
 from bson.objectid import ObjectId
+from pymongo import ReturnDocument, ASCENDING
 from .serializers import*
 
 users_collection = db['users']
@@ -21,6 +22,22 @@ def generate_tokens_for_mongo_user(user_doc):
     }
     secret_key = os.getenv('SECRET_KEY', 'django-insecure-fallback-key')
     return jwt.encode(payload, secret_key, algorithm='HS256')
+
+
+def get_token_data(request):
+    auth_header = request.headers.get('Authorization', '')
+    if not auth_header.startswith('Bearer '):
+        return None, None
+    token = auth_header.split(' ')[1]
+    try:
+        payload = jwt.decode(
+            token,
+            os.getenv('SECRET_KEY', 'django-insecure-fallback-key'),
+            algorithms=['HS256']
+        )
+        return payload.get('user_id'), payload.get('role')
+    except Exception:
+        return None, None
 
 # ==========================================
 # 1. VENDOR REGISTER API
@@ -372,3 +389,219 @@ class GetInventoryListAPIView(APIView):
 
         except Exception as e:
             return Response({"status": 0, "message": f"Error: {str(e)}"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+
+slots_collection   = db['slots']
+vendors_collection = db['vendors']
+
+# ══════════════════════════════════════════
+# 1. SLOT CREATE
+#    POST /api/vendor/slots/create/
+# ══════════════════════════════════════════
+class SlotCreateAPIView(APIView):
+
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        if role != 'vendor':
+            return Response({
+                'status':  0,
+                'message': 'Only vendors can create slots.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # ── Validation ──
+        serializer = SlotCreateSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({
+                'status':  0,
+                'message': 'Validation error',
+                'errors':  serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        # ── Same slot already exist check ──
+        existing = slots_collection.find_one({
+            'vendor_user_id': user_id,
+            'date':           str(data['date']),
+            'time_from':      data['time_from'],
+            'time_to':        data['time_to'],
+        })
+        if existing:
+            return Response({
+                'status':  0,
+                'message': 'This slot already exists.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        now      = datetime.now(timezone.utc)
+        slot_doc = {
+            'vendor_user_id': user_id,
+            'date':           str(data['date']),   # "2026-06-20"
+            'time_from':      data['time_from'],   # "08:00 AM"
+            'time_to':        data['time_to'],     # "09:00 AM"
+            'capacity':       data['capacity'],
+            'booked':         0,
+            'created_at':     now,
+            'updated_at':     now,
+        }
+
+        result = slots_collection.insert_one(slot_doc)
+        slot_doc['_id']        = str(result.inserted_id)
+        slot_doc['created_at'] = now.isoformat()
+        slot_doc['updated_at'] = now.isoformat()
+
+        return Response({
+            'status':  1,
+            'message': 'Slot created successfully.',
+            'data':    slot_doc
+        }, status=status.HTTP_201_CREATED)
+
+
+# ══════════════════════════════════════════
+# 2. SLOT LIST — Vendor ke saare slots
+#    POST /api/vendor/slots/list/
+# ══════════════════════════════════════════
+class SlotListAPIView(APIView):
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        if role != 'vendor':
+            return Response({
+                'status':  0,
+                'message': 'Only vendors can view their slots.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # ── Optional date filter ──
+        date = request.data.get('date')
+
+        match_query = {'vendor_user_id': user_id}
+        if date:
+            match_query['date'] = date
+
+        # ── Aggregation Pipeline ──
+        # Fast — index on vendor_user_id + date
+        pipeline = [
+            {'$match': match_query},
+            {'$sort':  {'date': ASCENDING, 'time_from': ASCENDING}},
+            {'$project': {
+                '_id':            {'$toString': '$_id'},
+                'date':           1,
+                'time_from':      1,
+                'time_to':        1,
+                'capacity':       1,
+                'booked':         1,
+                'remaining':      {'$subtract': ['$capacity', '$booked']},
+                # Label automatically calculate
+                'label': {
+                    '$switch': {
+                        'branches': [
+                            # Full
+                            {
+                                'case':  {'$gte': ['$booked', '$capacity']},
+                                'then':  'Full'
+                            },
+                            # Limited — 20% se kam bachi
+                            {
+                                'case': {
+                                    '$lte': [
+                                        {'$subtract': ['$capacity', '$booked']},
+                                        {'$multiply': ['$capacity', 0.2]}
+                                    ]
+                                },
+                                'then': 'Limited'
+                            },
+                        ],
+                        'default': 'Good Time'
+                    }
+                },
+                'created_at': {'$dateToString': {
+                    'format': '%Y-%m-%dT%H:%M:%S',
+                    'date':   '$created_at'
+                }},
+            }}
+        ]
+
+        slots = list(slots_collection.aggregate(pipeline))
+
+        return Response({
+            'status':  1,
+            'message': 'Slots fetched successfully.',
+            'count':   len(slots),
+            'data':    slots
+        }, status=status.HTTP_200_OK)
+
+
+# ══════════════════════════════════════════
+# 3. SLOT DELETE
+#    POST /api/vendor/slots/delete/
+# ══════════════════════════════════════════
+class SlotDeleteAPIView(APIView):
+    def post(self, request):
+        # ── Auth ──
+        user_id, role = get_token_data(request)
+        if not user_id:
+            return Response({
+                'status':  0,
+                'message': 'Authorization token missing or invalid.'
+            }, status=status.HTTP_401_UNAUTHORIZED)
+
+        if role != 'vendor':
+            return Response({
+                'status':  0,
+                'message': 'Only vendors can delete slots.'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        # ── Validation ──
+        serializer = SlotDeleteSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response({
+                'status':  0,
+                'message': 'Validation error',
+                'errors':  serializer.errors
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        slot_id = serializer.validated_data['slot_id']
+
+        # ── Slot fetch ──
+        try:
+            slot = slots_collection.find_one({
+                '_id':            ObjectId(slot_id),
+                'vendor_user_id': user_id        # sirf apna slot delete kare
+            })
+        except Exception:
+            return Response({
+                'status':  0,
+                'message': 'Invalid slot_id.'
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        if not slot:
+            return Response({
+                'status':  0,
+                'message': 'Slot not found.'
+            }, status=status.HTTP_404_NOT_FOUND)
+
+        # ── Booked slot delete nahi hoga ──
+        if slot.get('booked', 0) > 0:
+            return Response({
+                'status':  0,
+                'message': f"Cannot delete. {slot['booked']} bookings already exist."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        slots_collection.delete_one({'_id': ObjectId(slot_id)})
+
+        return Response({
+            'status':  1,
+            'message': 'Slot deleted successfully.'
+        }, status=status.HTTP_200_OK)

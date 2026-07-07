@@ -29,3 +29,48 @@ class VerifyOTPSerializer(serializers.Serializer):
 class PlaceOrderSerializer(serializers.Serializer):
     user_id = serializers.CharField(required=True)
     animal_id = serializers.CharField(required=True)
+
+    from rest_framework import serializers
+
+
+class AnimalListSerializer(serializers.Serializer):
+    _id             = serializers.CharField()
+    animal_category = serializers.CharField()
+    breed           = serializers.CharField()
+    weight          = serializers.FloatField()
+    price           = serializers.FloatField()
+    images          = serializers.ListField(child=serializers.CharField())
+    status          = serializers.CharField()
+    # Vendor info bhi list mein dikhegi
+    slaughterhouse_name = serializers.CharField()
+    city                = serializers.CharField()
+
+
+class AnimalDetailSerializer(serializers.Serializer):
+    _id             = serializers.CharField()
+    animal_category = serializers.CharField()
+    breed           = serializers.CharField()
+    age             = serializers.IntegerField()
+    weight          = serializers.FloatField()
+    price           = serializers.FloatField()
+    description     = serializers.CharField(allow_null=True)
+    images          = serializers.ListField(child=serializers.CharField())
+    status          = serializers.CharField()
+    # Vendor detail
+    vendor_user_id      = serializers.CharField()
+    slaughterhouse_name = serializers.CharField()
+    city                = serializers.CharField()
+    vendor_rating       = serializers.FloatField(allow_null=True)
+    created_at          = serializers.DateTimeField()
+    # Pipeline se aane wale extra fields
+    vendor_rating    = serializers.FloatField(allow_null=True, required=False)
+    vendor_capacity  = serializers.IntegerField(allow_null=True, required=False)
+
+
+class AvailableDatesSerializer(serializers.Serializer):
+    vendor_user_id = serializers.CharField(required=True)
+
+
+class SlotsByDateSerializer(serializers.Serializer):
+    vendor_user_id = serializers.CharField(required=True)
+    date           = serializers.DateField(required=True)

@@ -15,4 +15,7 @@ urlpatterns = [
     path('profile/get/', views.GetVendorProfileAPIView.as_view(), name='get_vendor_profile'),
     path('profile/edit/', views.EditVendorProfileAPIView.as_view(), name='edit_vendor_profile'),
     path('inventory/list/', views.GetInventoryListAPIView.as_view(), name='get_inventory_list'),
+    path('slots/create/', views.SlotCreateAPIView.as_view(),  name='slot_create'),
+    path('slots/list/',   views.SlotListAPIView.as_view(),    name='slot_list'),
+    path('slots/delete/', views.SlotDeleteAPIView.as_view(),  name='slot_delete'),
 ]
